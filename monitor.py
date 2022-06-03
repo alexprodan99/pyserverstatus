@@ -1,10 +1,18 @@
 import argparse
+import json
 import logging
+import os
 import smtplib
 import time
+from dotenv import load_dotenv
 from pyserverstatus import is_running
 from threading import Timer
 from functools import partial
+from os.path import basename
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import COMMASPACE, formatdate
 
 # time constants
 DAY = 86400
@@ -14,7 +22,6 @@ SECOND = 1
 
 # email
 error_count = 0
-sender = 'localmonitor@monitor.com'
 receivers = []
 
 # logging
@@ -65,15 +72,57 @@ class Scheduler(object):
 
 
 # send email
-def send_email():
-    global sender
-    global receivers
+def _collect_receivers(file_path):
+    receivers = []
+    with open(file_path) as file:
+        data = json.load(file)
+        receivers = [receiver for receiver in data['receivers']]
+    return receivers
+
+
+def _send_email(send_from, send_to, subject, text, files=[], server="localhost", port=587, username='', password='', use_tls=False):
     logging.info("Sending email")
+
+    message = MIMEMultipart()
+    message['From'] = send_from
+    message['To'] = COMMASPACE.join(send_to)
+    message['Date'] = formatdate(localtime=True)
+    message['Subject'] = subject
+    message.attach(MIMEText(text))
+
+    for file in files:
+        with open(file, "rb") as file_bytes:
+            part = MIMEApplication(file_bytes.read(), Name=basename(file))
+            part['Content-Disposition'] = 'attachment; filename="%s"' % basename(file)
+            message.attach(part)
+
+    smtp = smtplib.SMTP(server, port)
+    if use_tls:
+        smtp.starttls()
+    if username and password:
+        smtp.login(username, password) 
+    smtp.sendmail(send_from, send_to, message.as_string())
+    smtp.close()
     
+def send_monitor_email(address, port):
+    global receivers
+    _send_email(
+            send_from=os.getenv('SMTP_USER'),
+            send_to=receivers,
+            subject="Monitoring Alert",
+            text=f"{address}:{port} is not running.",
+            files=["./monitor.log"],
+            server="smtp.gmail.com",
+            port=587,
+            username=os.getenv('SMTP_USER'),
+            password=os.getenv('SMTP_PASSWORD'),
+            use_tls=True
+    )
+
 
 
 # log status
-def log_status(address, port, error_limit):
+def check_status(address, port, error_limit):
     global error_count
     if is_running(address, port):
         logging.info(f"{address}:{port} is running")
@@ -84,10 +133,14 @@ def log_status(address, port, error_limit):
             error_count += 1
         else:
             error_count = 0
-            send_email()
+            send_monitor_email(address, port)
+            
 
 # main
 if __name__ == '__main__':
+    # load env variables
+    load_dotenv()
+
     parser = argparse.ArgumentParser()
     parser.add_argument("server_address", help="[required] server address for monitoring", type=str)
     parser.add_argument("--port", help="[optional] port number for server. default value is 80", default=80)
@@ -98,9 +151,12 @@ if __name__ == '__main__':
     parser.add_argument("--limit", help="[optional] number of errors logs that must be recorded before sending an email. [default] value is 5", default=5)
     args = parser.parse_args()
     
+    # collect receivers
+    receivers = _collect_receivers('receivers.json')
+
     interval = args.days * DAY + args.hours * HOUR + args.minutes * MINUTE + args.seconds * SECOND
 
-    scheduler = Scheduler(interval, log_status, args=[args.server_address, args.port, args.limit])
+    scheduler = Scheduler(interval, check_status, args=[args.server_address, args.port, args.limit])
 
     print("Starting monitor, press CTRL+C to stop.")
 
